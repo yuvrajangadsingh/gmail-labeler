@@ -46,7 +46,7 @@ function excludeLabeled() {
 }
 
 function classifyAndLabelEmails() {
-  const threads = GmailApp.search('is:unread ' + excludeLabeled(), 0, BATCH_SIZE);
+  const threads = GmailApp.search('newer_than:1d ' + excludeLabeled(), 0, BATCH_SIZE);
 
   if (threads.length === 0) return;
 

@@ -1,11 +1,16 @@
-const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY'; // Get from https://aistudio.google.com/apikey
-const GEMINI_MODEL = 'gemini-2.0-flash-lite';
+const GCP_PROJECT = 'YOUR_GCP_PROJECT_ID'; // Google Cloud project with the Vertex AI API enabled
+const GCP_REGION = 'us-central1';
+const GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const BATCH_SIZE = 10;
+const DAILY_REQUEST_CAP = 200;
+const LOOKBACK_DAYS = 7;          // was an implicit 1: anything unlabelled after 24h was lost forever
+const CAP_REACHED = '__CAP_REACHED__';  // distinct from null, which means a real API failure
 
 const VALID_LABELS = [
   'Jobs/Recruiter',
   'Finance',
   'Transactions',
+  'Notices',
   'Travel',
   'Rides',
   'Dining',
@@ -20,11 +25,12 @@ const VALID_LABELS = [
   'System'
 ];
 
-const CLASSIFICATION_PROMPT = `You are an email classifier. Classify the email into exactly ONE of these categories:
+const CLASSIFICATION_PROMPT = `You are an email classifier. Classify the email by its MAIN PURPOSE into exactly ONE of these categories. Ignore incidental offers, footers and signatures.
 
 - Jobs/Recruiter — job opportunities, recruiter outreach, hiring, interview scheduling
-- Finance — investments, stocks, mutual funds, demat, portfolio, tax filings, insurance, salary credits, SIP, IPO, market reports
-- Transactions — UPI payments, credit card spends, bank debits, payment receipts, EMI, recharges, bill payments, NEFT transfers
+- Finance — the reader's own money and holdings: bank and credit card statements, bills and dues (including an upcoming subscription renewal), SIP or auto-pay FAILURES and mandate notices, IPO allotment or refund, demat/CAS/holding statements, dividends, REIT distributions and TDS notices, tax filings and intimations, insurance policies and renewals, salary credits, loan or overdraft documents, KYC or compliance requests from the reader's own bank, broker or fund house, credit report access notices. NOT market digests or research (Newsletters). NOT "IPO/NFO now open", "apply now", webinars, courses (Promotions). NOT completed payments (Transactions). NOT statutory bulk mail (Notices).
+- Transactions — completed or in-progress money movements and account alerts: UPI payments, card spends, bank debits and credits, payment received, NEFT/IMPS transfers, daily balance alerts, EMI debits, recharges, bill payments made, SIP installments that SUCCEEDED, deposits being processed, payment receipts
+- Notices — statutory bulk mail sent to all unitholders or shareholders: scheme or company financial results, e-voting and postal ballots, proxy notices, exchange funds/securities balance confirmations, SEBI or regulatory disclosures
 - Travel — flight bookings, boarding passes, hotel reservations, train tickets, airport lounge, trip itineraries, airline GST invoices. NOT airline loyalty points (those go to Promotions). NOT restaurant reservations (those go to Dining).
 - Rides — Uber trips, Ola rides, Rapido, cab bookings, ride receipts, trip summaries from ride apps
 - Dining — restaurant reservations, table bookings, dine-in confirmations, Dineout reservations, "Reservation confirmed" from Swiggy/Zomato/EazyDiner. NOT food delivery.
@@ -32,27 +38,29 @@ const CLASSIFICATION_PROMPT = `You are an email classifier. Classify the email i
 - Splitwise — Splitwise notifications, expense splits, group expenses, settlement reminders, balance updates
 - Shopping — orders, deliveries, returns, receipts, tracking updates
 - GitHub — pull requests, issues, CI/CD notifications, code reviews, repository activity
-- Newsletters — blog digests, weekly roundups, dev newsletters, content subscriptions, Pinterest recommendations, career advice articles, tech announcements
+- Newsletters — blog digests, weekly roundups, dev newsletters, content subscriptions, Pinterest recommendations, career advice articles, tech announcements, market digests, daily market wraps, stock ideas and research notes from brokers or fund houses (even about stocks the reader holds)
 - Social — LinkedIn, Twitter, Instagram, WhatsApp, social media notifications
-- Promotions — marketing emails, discount offers, deals, product launches
+- Promotions — marketing emails, discount offers, deals, product launches, IPO/NFO launch or "apply now" mails, investing webinars and workshops, app feature announcements, credit-score and "upgrade your plan" nudges
 - Personal — direct personal emails from people you know
-- System — STRICTLY ONLY: OTPs, verification codes, password resets, security alerts, new device sign-ins, two-factor authentication codes, scheduled maintenance/downtime notices. Account summaries go to Finance. Surveys go to Promotions. Appointments go to Personal. App feature announcements go to Newsletters.
+- System — STRICTLY ONLY: OTPs, verification codes, password resets, security alerts, new device sign-ins, two-factor authentication codes, payee added or limit changed notices, scheduled maintenance/downtime notices. Surveys go to Promotions. Appointments go to Personal.
 
 Reply with ONLY the category name. Nothing else. No explanation.`;
 
 // Build exclusion query so we skip emails already labeled by us
 function excludeLabeled() {
-  return VALID_LABELS.map(function(l) { return '-label:' + l.replace('/', '-'); }).join(' ');
+  return VALID_LABELS.concat(['Unsorted']).map(function(l) { return '-label:' + l.replace('/', '-'); }).join(' ');
 }
 
 function classifyAndLabelEmails() {
-  const threads = GmailApp.search('newer_than:1d ' + excludeLabeled(), 0, BATCH_SIZE);
+  resortIfPromptChanged();
+  const threads = GmailApp.search('newer_than:' + LOOKBACK_DAYS + 'd ' + excludeLabeled(), 0, BATCH_SIZE);
 
   if (threads.length === 0) return;
 
   for (let i = 0; i < threads.length; i++) {
     const thread = threads[i];
-    const message = thread.getMessages()[0];
+    const msgs = thread.getMessages();
+    const message = msgs[msgs.length - 1];   // newest: the search matched a recent reply, not the opener
 
     const from = message.getFrom();
     const subject = message.getSubject();
@@ -60,9 +68,14 @@ function classifyAndLabelEmails() {
 
     const category = classifyWithGemini(from, subject, body);
 
-    if (category === null) {
-      Logger.log('API error — stopping to avoid wasting quota.');
+    if (category === CAP_REACHED) {
+      Logger.log('Daily cap reached. Remaining threads stay queued for tomorrow.');
       return;
+    }
+
+    if (category === null) {
+      Logger.log('Classification failed for this thread; continuing with the batch.');
+      continue;
     }
 
     if (VALID_LABELS.includes(category)) {
@@ -70,11 +83,12 @@ function classifyAndLabelEmails() {
       thread.addLabel(label);
       Logger.log('Labeled: "' + subject + '" → ' + category);
     } else {
-      Logger.log('Skipped (unrecognized category "' + category + '"): "' + subject + '"');
+      thread.addLabel(getOrCreateLabel('Unsorted'));
+      Logger.log('Unsorted (model said "' + category + '"): "' + subject + '"');
     }
 
     // Respect Gemini rate limits
-    Utilities.sleep(1000);
+    Utilities.sleep(500);
   }
 }
 
@@ -92,6 +106,7 @@ function bulkLabelLastNDays(days) {
 
     const threads = GmailApp.search(query, start, BATCH_SIZE);
     if (threads.length === 0) break;
+    var labelledThisPage = 0;
 
     for (let i = 0; i < threads.length; i++) {
       if (isTimeLimitClose()) {
@@ -108,26 +123,39 @@ function bulkLabelLastNDays(days) {
 
       var category = classifyWithGemini(from, subject, body);
 
+      if (category === CAP_REACHED) {
+        Logger.log('Daily cap reached. Stopping bulk run; rerun tomorrow.');
+        return;
+      }
+
       // Retry once after a pause if rate limited
       if (category === null) {
         Logger.log('Rate limited — waiting 10s and retrying...');
         Utilities.sleep(10000);
         category = classifyWithGemini(from, subject, body);
+        if (category === CAP_REACHED) {
+          Logger.log('Daily cap reached on retry. Stopping bulk run.');
+          return;
+        }
       }
 
       if (category && VALID_LABELS.includes(category)) {
         const label = getOrCreateLabel(category);
         thread.addLabel(label);
+        labelledThisPage++;
         Logger.log('Labeled: "' + subject + '" → ' + category);
       } else {
         Logger.log('Skipped (will retry): "' + subject + '" (got: "' + category + '")');
       }
 
       total++;
-      Utilities.sleep(1000);
+      Utilities.sleep(500);
     }
 
-    start += BATCH_SIZE;
+    // Labelled threads drop out of the query, so the next page shifts down to where
+    // this one was. Advancing unconditionally skipped every other page. Only step over
+    // a page when nothing on it got labelled, otherwise this would spin on it forever.
+    if (labelledThisPage === 0) start += BATCH_SIZE;
   }
 
   Logger.log('Bulk labeling complete. Total processed: ' + total);
@@ -144,14 +172,31 @@ function bulkLabel7Days() {
 }
 
 function classifyWithGemini(from, subject, body) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd');
+    const counterKey = 'reqs_' + today;
+    const reqsToday = parseInt(props.getProperty(counterKey) || '0', 10);
+    if (reqsToday >= DAILY_REQUEST_CAP) {
+      Logger.log('Daily request cap (' + DAILY_REQUEST_CAP + ') hit. Will resume tomorrow.');
+      return CAP_REACHED;
+    }
+    props.setProperty(counterKey, String(reqsToday + 1));
+  } finally {
+    lock.releaseLock();
+  }
+
   const emailContent = 'From: ' + from + '\nSubject: ' + subject + '\nContent: ' + body;
   const prompt = CLASSIFICATION_PROMPT + '\n\n' + emailContent;
 
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-              GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY;
+  const url = 'https://' + GCP_REGION + '-aiplatform.googleapis.com/v1/projects/' +
+              GCP_PROJECT + '/locations/' + GCP_REGION +
+              '/publishers/google/models/' + GEMINI_MODEL + ':generateContent';
 
   const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
     generationConfig: {
       temperature: 0.1,
       maxOutputTokens: 20
@@ -162,22 +207,49 @@ function classifyWithGemini(from, subject, body) {
     const response = UrlFetchApp.fetch(url, {
       method: 'post',
       contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
       payload: JSON.stringify(payload),
       muteHttpExceptions: true
     });
 
-    const result = JSON.parse(response.getContentText());
-
-    if (result.error) {
-      Logger.log('Gemini API error: ' + result.error.message);
+    const code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('Vertex HTTP ' + code + ': ' + response.getContentText().substring(0, 500));
       return null;
     }
 
-    return result.candidates[0].content.parts[0].text.trim();
+    const result = JSON.parse(response.getContentText());
+
+    if (result.error) {
+      Logger.log('Vertex API error: ' + result.error.message);
+      return null;
+    }
+
+    if (!result.candidates || !result.candidates[0]) {
+      Logger.log('No candidates in response.');
+      return null;
+    }
+
+    const raw = result.candidates[0].content.parts[0].text.trim().replace(/^[^A-Za-z]+|[^A-Za-z\/]+$/g, '');
+    const hit = VALID_LABELS.find(function(l) { return l.toLowerCase() === raw.toLowerCase(); });
+    return hit || raw;
   } catch (error) {
     Logger.log('Classification error: ' + error);
     return null;
   }
+}
+
+// Bump PROMPT_VERSION when the prompt changes: the next run strips Finance from the last 7 days so the normal loop re-sorts them (10 per run).
+const PROMPT_VERSION = 2;
+function resortIfPromptChanged() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('labels_version') !== String(PROMPT_VERSION)) { colorizeLabels(); props.setProperty('labels_version', String(PROMPT_VERSION)); }  // new labels arrive with prompt changes, colour them once
+  if (props.getProperty('prompt_version') === String(PROMPT_VERSION)) return;
+  const label = GmailApp.getUserLabelByName('Finance');
+  const threads = label ? GmailApp.search('label:Finance newer_than:7d', 0, 500) : [];
+  threads.forEach(function(t) { t.removeLabel(label); });
+  props.setProperty('prompt_version', String(PROMPT_VERSION));
+  Logger.log('Prompt v' + PROMPT_VERSION + ': stripped Finance from ' + threads.length + ' threads for re-sorting.');
 }
 
 function getOrCreateLabel(name) {
@@ -367,24 +439,6 @@ function countEmails() {
   });
 }
 
-// List available Gemini models — run this to see what you have access to
-function listModels() {
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models?key=' + GEMINI_API_KEY;
-  const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  const result = JSON.parse(response.getContentText());
-
-  if (result.error) {
-    Logger.log('Error: ' + result.error.message);
-    return;
-  }
-
-  result.models.forEach(function(model) {
-    if (model.supportedGenerationMethods && model.supportedGenerationMethods.includes('generateContent')) {
-      Logger.log(model.name);
-    }
-  });
-}
-
 // Color labels — run once after enabling Gmail Advanced Service
 // (Apps Script → Services + → Gmail API → Add)
 function colorizeLabels() {
@@ -392,6 +446,8 @@ function colorizeLabels() {
     'Jobs/Recruiter': { bg: '#16a766', text: '#ffffff' },
     'Finance':        { bg: '#4a86e8', text: '#ffffff' },
     'Transactions':   { bg: '#ff7537', text: '#ffffff' },
+    'Notices':        { bg: '#666666', text: '#ffffff' },
+    'Unsorted':       { bg: '#cccccc', text: '#000000' },
     'Travel':         { bg: '#0b804b', text: '#ffffff' },
     'Rides':          { bg: '#44b984', text: '#ffffff' },
     'Dining':         { bg: '#822111', text: '#ffffff' },
@@ -432,4 +488,20 @@ function removeTrigger() {
   });
 
   Logger.log('Trigger removed.');
+}
+
+
+// Cleanup old daily request counter keys (run occasionally, manually or via trigger)
+function cleanupOldRequestCounters() {
+  const props = PropertiesService.getScriptProperties();
+  const all = props.getProperties();
+  const today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd');
+  let deleted = 0;
+  for (const key in all) {
+    if (key.indexOf('reqs_') === 0 && key !== 'reqs_' + today) {
+      props.deleteProperty(key);
+      deleted++;
+    }
+  }
+  Logger.log('Deleted ' + deleted + ' old request counter keys.');
 }
